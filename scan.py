@@ -406,6 +406,42 @@ ENTRYPOINT_PATTERNS = {
 }
 
 
+def compute_language_profiles(components: list, all_files: list):
+    """Compute per-component language breakdown from the file inventory."""
+    for comp in components:
+        comp_path = comp["path"]
+        prefix = comp_path + "/" if comp_path != "." else ""
+
+        profile = defaultdict(lambda: {"loc": 0, "files": 0})
+        total_loc = 0
+        for f in all_files:
+            if prefix and not f["path"].startswith(prefix):
+                continue
+            if not prefix and comp_path != ".":
+                continue
+            lang = f.get("lang")
+            if lang:
+                profile[lang]["loc"] += f["loc"]
+                profile[lang]["files"] += 1
+                total_loc += f["loc"]
+
+        comp["languageProfile"] = {
+            lang: {
+                "loc": stats["loc"],
+                "files": stats["files"],
+                "pct": round(stats["loc"] / total_loc * 100, 1) if total_loc else 0,
+            }
+            for lang, stats in sorted(profile.items(), key=lambda x: -x[1]["loc"])
+        }
+        comp["totalLoc"] = total_loc
+
+        # Update primary language from profile if "make" was selected but real code exists
+        if comp["language"] == "make" and profile:
+            best_lang = max(profile.items(), key=lambda x: x[1]["loc"])
+            if best_lang[0] != "make":
+                comp["language"] = best_lang[0]
+
+
 def detect_services(root: Path, components: list, all_files: list):
     """Detect entrypoints, ports, and classify components."""
     for comp in components:
@@ -737,7 +773,17 @@ def format_human(root: Path, lang_files, components, build_systems, edges=None):
         if comp.get("compileTarget"):
             lang_str += f"→{comp['compileTarget']}"
 
-        lines.append(f"  {role_icon} {comp['name']:<30} {lang_str:<20} {comp['path']}{ports_str}{entry_str}")
+        loc_str = f"{comp.get('totalLoc', 0):>6} LOC"
+
+        # Show embedded languages (non-primary, > 0.5%)
+        profile = comp.get("languageProfile", {})
+        embedded = []
+        for elang, estats in profile.items():
+            if elang != comp["language"] and estats["pct"] >= 0.5:
+                embedded.append(f"{elang} {estats['pct']}%")
+        embed_str = f"  +[{', '.join(embedded)}]" if embedded else ""
+
+        lines.append(f"  {role_icon} {comp['name']:<30} {lang_str:<20} {loc_str}{ports_str}{entry_str}{embed_str}")
 
     # Connections
     if edges:
@@ -800,6 +846,7 @@ def main():
 
     lang_files, manifests, build_systems, all_files = scan_directory(root)
     components = discover_components(root, manifests)
+    compute_language_profiles(components, all_files)
     components = detect_services(root, components, all_files)
     edges = infer_connections(root, components, all_files)
 

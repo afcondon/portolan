@@ -397,10 +397,9 @@ def generate_topology_section(components, connections, clusters):
         x, y = positions[comp["name"]]
         lang = comp["language"]
         color = lang_color(lang)
-        loc = sum(f.get("loc", 0) for f in [] ) # we don't have per-comp LOC in scan
-        # Use a fixed radius for now, vary by role
-        r = {"service": 18, "executable": 13, "library": 10,
-             "workspace-root": 8, "binary": 13}.get(comp["role"], 10)
+        total_loc = comp.get("totalLoc", 0)
+        # Size by LOC: sqrt scale, clamped
+        r = max(8, min(30, int(5 + math.sqrt(total_loc) / 8)))
 
         svg_parts.append(
             f'<circle cx="{x}" cy="{y}" r="{r}" fill="{color}" '
@@ -638,12 +637,46 @@ def generate_component_table(components, connections):
         role_class = f"role-{comp['role']}"
         ports = ", ".join(f":{p}" for p in comp.get("ports", []))
         n_conn = conn_count.get(comp["name"], 0)
+        total_loc = comp.get("totalLoc", 0)
+
+        # Language profile as a mini stacked bar
+        profile = comp.get("languageProfile", {})
+        bar_width = 120
+        bar_parts = []
+        if profile and total_loc > 0:
+            x = 0
+            for plang, pstats in profile.items():
+                w = max(1, pstats["pct"] / 100 * bar_width) if pstats["pct"] >= 0.5 else 0
+                if w > 0:
+                    pcolor = lang_color(plang)
+                    title = f"{plang}: {pstats['loc']} LOC ({pstats['pct']}%)"
+                    bar_parts.append(
+                        f'<rect x="{x}" y="0" width="{w}" height="12" '
+                        f'fill="{pcolor}" opacity="0.8"><title>{title}</title></rect>'
+                    )
+                    x += w
+            bar_svg = (
+                f'<svg width="{bar_width}" height="12" style="vertical-align:middle">'
+                + "".join(bar_parts)
+                + '</svg>'
+            )
+        else:
+            bar_svg = ""
+
+        lang_label = comp["language"]
+        if comp.get("compileTarget"):
+            lang_label += f"→{comp['compileTarget']}"
+
+        loc_display = f"{total_loc:,}" if total_loc else ""
+
         rows.append(
             f'<tr>'
             f'<td><span class="lang-dot" style="background:{color}"></span>'
             f'<strong>{comp["name"]}</strong></td>'
             f'<td><span class="role-badge {role_class}">{comp["role"]}</span></td>'
-            f'<td>{comp["language"]}</td>'
+            f'<td>{lang_label}</td>'
+            f'<td style="text-align:right;font-family:monospace;font-size:0.8rem">{loc_display}</td>'
+            f'<td>{bar_svg}</td>'
             f'<td style="font-family:monospace;font-size:0.8rem">{ports}</td>'
             f'<td style="text-align:center">{n_conn}</td>'
             f'<td style="color:#888;font-size:0.8rem">{comp["path"]}</td>'
@@ -660,6 +693,8 @@ def generate_component_table(components, connections):
                 <th>Component</th>
                 <th>Role</th>
                 <th>Language</th>
+                <th>LOC</th>
+                <th>Language Profile</th>
                 <th>Ports</th>
                 <th>Connections</th>
                 <th>Path</th>
