@@ -38,6 +38,27 @@ MANIFEST_SIGNATURES = {
     "deno.json":        "deno",
 }
 
+# Build orchestrators — these indicate a build system but not the source language.
+# When a directory has both a build orchestrator AND a language manifest,
+# the language manifest wins.
+BUILD_ORCHESTRATORS = {"Makefile", "CMakeLists.txt", "Justfile"}
+
+# Priority order: when multiple language manifests exist, prefer the more specific one.
+LANGUAGE_PRIORITY = {
+    "purescript": 10,
+    "rust": 10,
+    "go": 10,
+    "elixir": 10,
+    "python": 8,
+    "node": 6,
+    "java": 6,
+    "kotlin": 6,
+    "ruby": 6,
+    "cpp": 5,
+    "deno": 5,
+    "make": 1,  # lowest — build orchestrator, not a language
+}
+
 EXTENSION_LANGUAGES = {
     ".rs":    "rust",
     ".purs":  "purescript",
@@ -241,11 +262,26 @@ def discover_components(root: Path, manifests: dict):
                     member_path = str(Path(mdir) / member) if mdir != "." else member
                     workspace_members.append(member_path)
 
-    for mpath, info in sorted(manifests.items(), key=lambda x: len(x[0])):
-        mdir = info["dir"]
+    # Group all manifests by directory
+    dir_manifests = defaultdict(list)
+    for mpath, info in manifests.items():
+        dir_manifests[info["dir"]].append(info)
+
+    for mdir, dir_infos in sorted(dir_manifests.items(), key=lambda x: len(x[0])):
         if mdir in seen_dirs:
             continue
         seen_dirs.add(mdir)
+
+        # Pick the best language signal: prefer language manifests over build orchestrators
+        best_info = max(dir_infos, key=lambda i: LANGUAGE_PRIORITY.get(i["language"], 0))
+
+        # Detect transpilation: if we have both PureScript source and Erlang output,
+        # or the spago.yaml references the purerl backend, note it
+        compile_target = None
+        langs_present = {i["language"] for i in dir_infos}
+        if best_info["language"] == "purescript":
+            comp_dir = root / mdir if mdir != "." else root
+            compile_target = detect_compile_target(comp_dir)
 
         is_workspace_root = mdir == "." and workspace_members
         is_workspace_member = any(
@@ -253,12 +289,18 @@ def discover_components(root: Path, manifests: dict):
         )
 
         component = {
-            "name": derive_component_name(root, mdir, info),
+            "name": derive_component_name(root, mdir, best_info),
             "path": mdir,
-            "language": info["language"],
-            "manifest": info["file"],
+            "language": best_info["language"],
+            "manifest": best_info["file"],
             "role": "unknown",
         }
+        if compile_target:
+            component["compileTarget"] = compile_target
+        # Record all build systems found in this directory
+        build_systems_here = [i["file"] for i in dir_infos if i["file"] in BUILD_ORCHESTRATORS]
+        if build_systems_here:
+            component["buildOrchestrator"] = build_systems_here[0]
 
         if is_workspace_root and not is_workspace_member:
             component["role"] = "workspace-root"
@@ -268,6 +310,32 @@ def discover_components(root: Path, manifests: dict):
         components.append(component)
 
     return components
+
+
+def detect_compile_target(comp_dir: Path) -> str | None:
+    """Detect if a PureScript project compiles to a non-default backend."""
+    # Check spago.yaml for backend config
+    spago = comp_dir / "spago.yaml"
+    if spago.exists():
+        try:
+            text = spago.read_text()
+            if "purerl" in text or "backend: erl" in text:
+                return "erlang"
+            if "backend:" in text and "python" in text:
+                return "python"
+        except Exception:
+            pass
+
+    # Check for .erl files in src/ (purerl output)
+    src_dir = comp_dir / "src"
+    if src_dir.is_dir():
+        erl_files = list(src_dir.glob("*.erl"))
+        purs_files = list(src_dir.glob("**/*.purs"))
+        if erl_files and purs_files:
+            return "erlang"
+
+    # Check for output/*/index.js (standard JS backend — no need to flag)
+    return None
 
 
 def derive_component_name(root: Path, rel_dir: str, info: dict):
@@ -665,7 +733,11 @@ def format_human(root: Path, lang_files, components, build_systems, edges=None):
             kinds = set(e["kind"] for e in comp["entrypoints"])
             entry_str = f"  entry: {', '.join(kinds)}"
 
-        lines.append(f"  {role_icon} {comp['name']:<30} {comp['language']:<12} {comp['path']}{ports_str}{entry_str}")
+        lang_str = comp['language']
+        if comp.get("compileTarget"):
+            lang_str += f"→{comp['compileTarget']}"
+
+        lines.append(f"  {role_icon} {comp['name']:<30} {lang_str:<20} {comp['path']}{ports_str}{entry_str}")
 
     # Connections
     if edges:
