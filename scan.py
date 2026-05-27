@@ -428,10 +428,200 @@ def detect_services(root: Path, components: list, all_files: list):
 
 
 # ---------------------------------------------------------------------------
+# Layer 3 — How do they connect?
+# ---------------------------------------------------------------------------
+
+PROTOCOL_HINTS = {
+    re.compile(r"ws://[^\s\"']+"):          "websocket",
+    re.compile(r"wss://[^\s\"']+"):         "websocket",
+    re.compile(r"WebSocket"):               "websocket",
+    re.compile(r"cowboy"):                  "websocket",
+    re.compile(r"\bOSC\b|osc_send|osc_recv|oscMessage"): "osc",
+    re.compile(r"\.sock\b|unix.*socket|SOCK_STREAM"):     "unix-socket",
+    re.compile(r"grpc|\.proto\b"):          "grpc",
+    re.compile(r"fetch\(|axios|http\.get|urllib"): "http",
+}
+
+
+def infer_connections(root: Path, components: list, all_files: list):
+    """Infer edges between components from port references, shared deps, and protocol hints."""
+    edges = []
+
+    # Build port-to-component index: which component LISTENS on which port
+    port_owners = {}
+    for comp in components:
+        for port in comp.get("ports", []):
+            if comp["role"] in ("service", "executable", "binary"):
+                port_owners.setdefault(port, []).append(comp["name"])
+
+    # Build dependency index from package manifests
+    comp_deps = {}
+    for comp in components:
+        comp_dir = root / comp["path"] if comp["path"] != "." else root
+        deps = extract_dependencies(comp_dir, comp["manifest"], comp["language"])
+        comp_deps[comp["name"]] = deps
+
+    # For each component, scan source files for references to other components' ports
+    comp_by_name = {c["name"]: c for c in components}
+
+    for comp in components:
+        comp_path = comp["path"]
+        comp_files = [
+            f for f in all_files
+            if (f["path"].startswith(comp_path + "/") or comp_path == "."
+                or f["path"] == comp_path)
+        ]
+
+        port_refs = defaultdict(set)    # port -> set of file paths
+        protocol_refs = defaultdict(set)  # protocol -> set of file paths
+
+        for f in comp_files:
+            try:
+                text = (root / f["path"]).read_text(errors="replace")
+            except Exception:
+                continue
+
+            # Check for port references
+            for pat in PORT_PATTERNS:
+                for m in pat.finditer(text):
+                    port = int(m.group(1))
+                    if 1024 < port < 65535:
+                        port_refs[port].add(f["path"])
+
+            # Check for protocol hints
+            for pat, proto in PROTOCOL_HINTS.items():
+                if pat.search(text):
+                    protocol_refs[proto].add(f["path"])
+
+        # Generate edges from port references
+        for port, files in port_refs.items():
+            if port in port_owners:
+                for owner in port_owners[port]:
+                    if owner != comp["name"]:
+                        edge = {
+                            "from": comp["name"],
+                            "to": owner,
+                            "type": "port-reference",
+                            "port": port,
+                            "protocol": guess_protocol_for_port(port, protocol_refs),
+                            "evidence": sorted(files)[:3],
+                        }
+                        edges.append(edge)
+
+        # Generate edges from shared dependencies
+        for other_comp in components:
+            if other_comp["name"] == comp["name"]:
+                continue
+            other_deps = comp_deps.get(other_comp["name"], set())
+            my_deps = comp_deps.get(comp["name"], set())
+            # If one component appears as a dependency of the other
+            shared = my_deps & other_deps
+            shared_interesting = {
+                d for d in shared
+                if any(kw in d.lower() for kw in
+                       ("protocol", "shared", "types", "common", "core", "api"))
+            }
+            if shared_interesting:
+                existing = any(
+                    e["from"] == comp["name"] and e["to"] == other_comp["name"]
+                    and e["type"] == "shared-dependency"
+                    for e in edges
+                )
+                if not existing:
+                    edge = {
+                        "from": comp["name"],
+                        "to": other_comp["name"],
+                        "type": "shared-dependency",
+                        "packages": sorted(shared_interesting),
+                    }
+                    edges.append(edge)
+
+    # Deduplicate: keep one edge per (from, to, type) with strongest evidence
+    seen = set()
+    deduped = []
+    for e in edges:
+        key = (e["from"], e["to"], e["type"], e.get("port", ""))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(e)
+
+    return deduped
+
+
+def guess_protocol_for_port(port: int, protocol_refs: dict) -> str:
+    """Guess protocol from port number and context."""
+    if protocol_refs.get("websocket"):
+        return "websocket"
+    if protocol_refs.get("osc"):
+        return "osc"
+    if protocol_refs.get("grpc"):
+        return "grpc"
+    well_known = {
+        80: "http", 443: "https", 8080: "http", 3000: "http",
+        5432: "postgres", 3306: "mysql", 6379: "redis", 27017: "mongodb",
+    }
+    return well_known.get(port, "tcp")
+
+
+def extract_dependencies(comp_dir: Path, manifest: str, language: str) -> set:
+    """Extract dependency names from a component's manifest."""
+    deps = set()
+    manifest_path = comp_dir / manifest
+    if not manifest_path.exists():
+        return deps
+
+    try:
+        text = manifest_path.read_text()
+
+        if manifest == "package.json":
+            data = json.loads(text)
+            for key in ("dependencies", "devDependencies", "peerDependencies"):
+                deps.update(data.get(key, {}).keys())
+
+        elif manifest == "Cargo.toml":
+            in_deps = False
+            for line in text.split("\n"):
+                stripped = line.strip()
+                if stripped in ("[dependencies]", "[dev-dependencies]",
+                                "[build-dependencies]"):
+                    in_deps = True
+                    continue
+                if in_deps and stripped.startswith("["):
+                    in_deps = False
+                if in_deps:
+                    m = re.match(r'^(\S+)\s*=', stripped)
+                    if m:
+                        deps.add(m.group(1))
+
+        elif manifest in ("spago.yaml", "spago.dhall"):
+            in_deps = False
+            for line in text.split("\n"):
+                if "dependencies:" in line:
+                    in_deps = True
+                    continue
+                if in_deps and line.strip().startswith("- "):
+                    dep = line.strip().lstrip("- ").strip().strip("'\"")
+                    if dep:
+                        deps.add(dep)
+                elif in_deps and not line.startswith(" ") and line.strip():
+                    in_deps = False
+
+        elif manifest in ("pyproject.toml", "setup.py", "setup.cfg"):
+            for line in text.split("\n"):
+                m = re.match(r'^\s*"?([a-zA-Z0-9_-]+)', line)
+                if m and line.strip().startswith('"'):
+                    deps.add(m.group(1))
+    except Exception:
+        pass
+
+    return deps
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-def format_human(root: Path, lang_files, components, build_systems):
+def format_human(root: Path, lang_files, components, build_systems, edges=None):
     """Pretty-print results for terminal."""
     lines = []
     lines.append(f"Portolan scan: {root}")
@@ -477,13 +667,26 @@ def format_human(root: Path, lang_files, components, build_systems):
 
         lines.append(f"  {role_icon} {comp['name']:<30} {comp['language']:<12} {comp['path']}{ports_str}{entry_str}")
 
+    # Connections
+    if edges:
+        lines.append("")
+        lines.append("Connections:")
+        for e in edges:
+            if e["type"] == "port-reference":
+                proto = e.get("protocol", "tcp")
+                lines.append(f"  {e['from']} --> {e['to']}  :{e['port']} ({proto})")
+            elif e["type"] == "shared-dependency":
+                pkgs = ", ".join(e.get("packages", []))
+                lines.append(f"  {e['from']} <-> {e['to']}  shared: [{pkgs}]")
+
     lines.append("")
-    lines.append(f"Total: {len(components)} components, {total_loc} LOC, {len(lang_files)} languages")
+    n_edges = len(edges) if edges else 0
+    lines.append(f"Total: {len(components)} components, {total_loc} LOC, {len(lang_files)} languages, {n_edges} connections")
 
     return "\n".join(lines)
 
 
-def format_json(root: Path, lang_files, components, build_systems):
+def format_json(root: Path, lang_files, components, build_systems, edges=None):
     """Structured JSON output."""
     return json.dumps({
         "root": str(root),
@@ -497,6 +700,7 @@ def format_json(root: Path, lang_files, components, build_systems):
         },
         "buildSystems": sorted(build_systems),
         "components": components,
+        "connections": edges or [],
     }, indent=2)
 
 
@@ -525,11 +729,12 @@ def main():
     lang_files, manifests, build_systems, all_files = scan_directory(root)
     components = discover_components(root, manifests)
     components = detect_services(root, components, all_files)
+    edges = infer_connections(root, components, all_files)
 
     if use_json:
-        output = format_json(root, lang_files, components, build_systems)
+        output = format_json(root, lang_files, components, build_systems, edges)
     else:
-        output = format_human(root, lang_files, components, build_systems)
+        output = format_human(root, lang_files, components, build_systems, edges)
 
     if out_file:
         Path(out_file).write_text(output)
