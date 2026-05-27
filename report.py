@@ -44,6 +44,21 @@ def lang_color(lang):
     return LANG_COLORS.get(lang, "#aaaaaa")
 
 
+def pie_wedge(cx, cy, r, fraction, fill):
+    """SVG path for a pie wedge starting from 12 o'clock, clockwise."""
+    angle = fraction * 2 * math.pi
+    start_x = cx
+    start_y = cy - r
+    end_x = cx + r * math.sin(angle)
+    end_y = cy - r * math.cos(angle)
+    large_arc = 1 if fraction > 0.5 else 0
+    return (
+        f'<path d="M {cx} {cy} L {start_x} {start_y} '
+        f'A {r} {r} 0 {large_arc} 1 {end_x:.1f} {end_y:.1f} Z" '
+        f'fill="{fill}" opacity="0.9"/>'
+    )
+
+
 def generate_report(scan_data):
     components = scan_data["components"]
     connections = scan_data.get("connections", [])
@@ -397,15 +412,34 @@ def generate_topology_section(components, connections, clusters):
         x, y = positions[comp["name"]]
         lang = comp["language"]
         color = lang_color(lang)
+        target = comp.get("compileTarget")
         total_loc = comp.get("totalLoc", 0)
-        # Size by LOC: sqrt scale, clamped
         r = max(8, min(30, int(5 + math.sqrt(total_loc) / 8)))
 
-        svg_parts.append(
-            f'<circle cx="{x}" cy="{y}" r="{r}" fill="{color}" '
-            f'stroke="white" stroke-width="2" opacity="0.9"/>'
-        )
-        # Label
+        if target:
+            target_color = lang_color(target)
+            profile = comp.get("languageProfile", {})
+            source_loc = profile.get(lang, {}).get("loc", 0)
+            runtime_loc_val = profile.get(target, {}).get("loc", 0)
+            total_relevant = source_loc + runtime_loc_val
+            if total_relevant > 0:
+                source_frac = source_loc / total_relevant
+            else:
+                source_frac = 1.0
+            source_frac = max(0.08, min(0.92, source_frac))
+            # Base circle = runtime language
+            svg_parts.append(
+                f'<circle cx="{x}" cy="{y}" r="{r}" fill="{target_color}" '
+                f'stroke="white" stroke-width="2" opacity="0.9"/>'
+            )
+            # Source language wedge
+            svg_parts.append(pie_wedge(x, y, r, source_frac, color))
+        else:
+            svg_parts.append(
+                f'<circle cx="{x}" cy="{y}" r="{r}" fill="{color}" '
+                f'stroke="white" stroke-width="2" opacity="0.9"/>'
+            )
+
         name = comp["name"]
         if len(name) > 20:
             name = name[:18] + "..."
@@ -413,7 +447,6 @@ def generate_topology_section(components, connections, clusters):
             f'<text x="{x}" y="{y + r + 14}" text-anchor="middle" '
             f'font-size="9" fill="#333" font-family="sans-serif">{name}</text>'
         )
-        # Port badges
         if comp.get("ports"):
             port_str = ", ".join(str(p) for p in comp["ports"][:2])
             svg_parts.append(
@@ -432,18 +465,19 @@ def generate_topology_section(components, connections, clusters):
     </div>
     """
 
-    # Language legend
+    # Language legend — include both source and compile-target languages
     lang_legend_items = []
     seen_langs = set()
     for c in components:
-        if c["language"] not in seen_langs:
-            seen_langs.add(c["language"])
-            col = lang_color(c["language"])
-            lang_legend_items.append(
-                f'<div class="legend-item">'
-                f'<span class="lang-dot" style="background:{col}"></span>'
-                f'{c["language"]}</div>'
-            )
+        for lang_key in [c["language"], c.get("compileTarget")]:
+            if lang_key and lang_key not in seen_langs:
+                seen_langs.add(lang_key)
+                col = lang_color(lang_key)
+                lang_legend_items.append(
+                    f'<div class="legend-item">'
+                    f'<span class="lang-dot" style="background:{col}"></span>'
+                    f'{lang_key}</div>'
+                )
     lang_legend = f'<div class="legend">{"".join(lang_legend_items)}</div>'
 
     svg_str = "\n".join(svg_parts)
@@ -451,8 +485,10 @@ def generate_topology_section(components, connections, clusters):
     return f"""
 <section>
     <h2>System Topology</h2>
-    <p>Components grouped by subsystem. Node color indicates primary language,
-       size indicates role (services are largest). Edges show inferred connections.</p>
+    <p>Components grouped by subsystem. Transpiled components are pie charts:
+       base color is the runtime language, wedge is the source language,
+       proportional to LOC on disk. Size indicates total LOC.
+       Edges show inferred connections.</p>
     {legend}
     {lang_legend}
     <div class="figure">
@@ -502,28 +538,73 @@ def generate_treemap_section(components, languages):
     grid_items = []
     for comp in sorted(components, key=lambda c: (-{"service":3,"executable":2,"binary":2,"library":1}.get(c["role"],0), c["name"])):
         color = lang_color(comp["language"])
+        target = comp.get("compileTarget")
         role_class = f"role-{comp['role']}"
         ports = ""
         if comp.get("ports"):
             ports = f'<span style="color:#888;font-size:0.75rem"> :{",".join(str(p) for p in comp["ports"][:2])}</span>'
+        target_label = ""
+        right_border = ""
+        if target:
+            target_color = lang_color(target)
+            target_label = f'<span style="color:#888;font-size:0.7rem">→{target}</span>'
+            right_border = f"border-right:4px solid {target_color};"
         grid_items.append(
             f'<div style="display:inline-flex;align-items:center;gap:0.3rem;'
             f'margin:0.2rem 0.4rem;padding:0.25rem 0.5rem;'
             f'background:white;border:1px solid #e0e0e0;border-radius:4px;'
-            f'border-left:4px solid {color};font-size:0.8rem;">'
+            f'border-left:4px solid {color};{right_border}font-size:0.8rem;">'
             f'<span class="role-badge {role_class}">{comp["role"][:3]}</span>'
-            f'<strong>{comp["name"]}</strong>{ports}</div>'
+            f'<strong>{comp["name"]}</strong>{target_label}{ports}</div>'
         )
 
     bar_svg = "\n".join(bar_parts)
+
+    # Runtime bar — attribute each component's LOC to its compile target
+    runtime_loc = {}
+    for comp in components:
+        loc = comp.get("totalLoc", 0)
+        if not loc:
+            continue
+        target = comp.get("compileTarget")
+        runtime_lang = target if target else comp["language"]
+        runtime_loc[runtime_lang] = runtime_loc.get(runtime_lang, 0) + loc
+    runtime_total = sum(runtime_loc.values())
+    runtime_bar_parts = [f'<svg viewBox="0 0 {W} 40" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;">']
+    x = 0
+    for lang, loc in sorted(runtime_loc.items(), key=lambda x: -x[1]):
+        pct = loc / runtime_total if runtime_total else 0
+        w = pct * W
+        if w < 1:
+            continue
+        color = lang_color(lang)
+        runtime_bar_parts.append(
+            f'<rect x="{x}" y="0" width="{w}" height="30" fill="{color}" opacity="0.85"/>'
+        )
+        if w > 50:
+            runtime_bar_parts.append(
+                f'<text x="{x + w/2}" y="19" text-anchor="middle" '
+                f'font-size="10" fill="white" font-family="sans-serif" '
+                f'font-weight="600">{lang} {pct*100:.0f}%</text>'
+            )
+        x += w
+    runtime_bar_parts.append('</svg>')
+    runtime_bar_svg = "\n".join(runtime_bar_parts)
+
     grid = "\n".join(grid_items)
 
     return f"""
 <section>
     <h2>Language Breakdown</h2>
+    <h3>Source files on disk</h3>
     <div class="figure">
         {bar_svg}
-        <p class="figure-caption">Figure 2 &mdash; Lines of code by language (all scanned code, including vendored)</p>
+        <p class="figure-caption">Figure 2a &mdash; Lines of code by language (source files on disk)</p>
+    </div>
+    <h3>Runtime languages</h3>
+    <div class="figure">
+        {runtime_bar_svg}
+        <p class="figure-caption">Figure 2b &mdash; LOC by runtime language (PureScript&rarr;JS/Erlang, TypeScript&rarr;JS, etc.)</p>
     </div>
     <h3>Components</h3>
     <div style="display:flex;flex-wrap:wrap;gap:0;margin:1rem 0;">

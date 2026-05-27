@@ -23,6 +23,7 @@ MANIFEST_SIGNATURES = {
     "Cargo.toml":       "rust",
     "spago.yaml":       "purescript",
     "spago.dhall":      "purescript",
+    "tsconfig.json":    "typescript",
     "package.json":     "node",
     "pyproject.toml":   "python",
     "setup.py":         "python",
@@ -49,6 +50,7 @@ LANGUAGE_PRIORITY = {
     "rust": 10,
     "go": 10,
     "elixir": 10,
+    "typescript": 9,
     "python": 8,
     "node": 6,
     "java": 6,
@@ -275,13 +277,10 @@ def discover_components(root: Path, manifests: dict):
         # Pick the best language signal: prefer language manifests over build orchestrators
         best_info = max(dir_infos, key=lambda i: LANGUAGE_PRIORITY.get(i["language"], 0))
 
-        # Detect transpilation: if we have both PureScript source and Erlang output,
-        # or the spago.yaml references the purerl backend, note it
         compile_target = None
-        langs_present = {i["language"] for i in dir_infos}
-        if best_info["language"] == "purescript":
+        if best_info["language"] in ("purescript", "typescript"):
             comp_dir = root / mdir if mdir != "." else root
-            compile_target = detect_compile_target(comp_dir)
+            compile_target = detect_compile_target(comp_dir, best_info["language"])
 
         is_workspace_root = mdir == "." and workspace_members
         is_workspace_member = any(
@@ -309,32 +308,49 @@ def discover_components(root: Path, manifests: dict):
 
         components.append(component)
 
+    # Disambiguate components that share a name
+    name_counts = {}
+    for c in components:
+        name_counts[c["name"]] = name_counts.get(c["name"], 0) + 1
+    duped_names = {n for n, count in name_counts.items() if count > 1}
+    if duped_names:
+        for c in components:
+            if c["name"] in duped_names:
+                path = c["path"]
+                parts = Path(path).parts
+                suffix = parts[-1] if len(parts) <= 1 else "/".join(parts[-2:])
+                if suffix != c["name"]:
+                    c["name"] = f"{c['name']} ({suffix})"
+
     return components
 
 
-def detect_compile_target(comp_dir: Path) -> str | None:
-    """Detect if a PureScript project compiles to a non-default backend."""
-    # Check spago.yaml for backend config
-    spago = comp_dir / "spago.yaml"
-    if spago.exists():
-        try:
-            text = spago.read_text()
-            if "purerl" in text or "backend: erl" in text:
+def detect_compile_target(comp_dir: Path, source_lang: str) -> str | None:
+    """Detect what runtime language a source-language project compiles to."""
+    if source_lang == "purescript":
+        spago = comp_dir / "spago.yaml"
+        if spago.exists():
+            try:
+                text = spago.read_text()
+                if "purerl" in text or "backend: erl" in text:
+                    return "erlang"
+                if "backend:" in text and "python" in text:
+                    return "python"
+            except Exception:
+                pass
+
+        src_dir = comp_dir / "src"
+        if src_dir.is_dir():
+            erl_files = list(src_dir.glob("*.erl"))
+            purs_files = list(src_dir.glob("**/*.purs"))
+            if erl_files and purs_files:
                 return "erlang"
-            if "backend:" in text and "python" in text:
-                return "python"
-        except Exception:
-            pass
 
-    # Check for .erl files in src/ (purerl output)
-    src_dir = comp_dir / "src"
-    if src_dir.is_dir():
-        erl_files = list(src_dir.glob("*.erl"))
-        purs_files = list(src_dir.glob("**/*.purs"))
-        if erl_files and purs_files:
-            return "erlang"
+        return "javascript"
 
-    # Check for output/*/index.js (standard JS backend — no need to flag)
+    if source_lang == "typescript":
+        return "javascript"
+
     return None
 
 
